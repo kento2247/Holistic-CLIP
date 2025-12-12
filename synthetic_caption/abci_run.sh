@@ -3,7 +3,7 @@
 mkdir -p job
 
 
-for i in $(seq 30 87); do
+for i in $(seq 0 0); do
     start=$((i * 1000))
     end=$((start + 1000))
 
@@ -22,7 +22,10 @@ module load cuda/11.8/11.8.0
 cd /home/acc12645mq/amemiya/workspace/Holistic-CLIP/synthetic_caption
 source .venv/bin/activate
 
-python /home/acc12645mq/amemiya/workspace/Holistic-CLIP/synthetic_caption/compute_recon.py --dataset_root /home/acc12645mq/amemiya/workspace/data/fractal_dataset --start_idx $start --end_idx $end --ckpt_path /home/acc12645mq/amemiya/workspace/Holistic-CLIP/synthetic_caption/checkpoints/droid.pth
+python internvl_simple.py \
+    --start_idx ${start} \
+    --end_idx ${end} \
+    --output_json cc3m_captions_internvl_${start}_${end}.json
 EOF
     qsub -m n job/internvl_job_${i}.sh
 done

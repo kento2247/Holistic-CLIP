@@ -9,97 +9,6 @@ from tqdm import tqdm
 import json
 
 
-IMAGENET_MEAN = (0.485, 0.456, 0.406)
-IMAGENET_STD = (0.229, 0.224, 0.225)
-
-
-def build_transform(input_size):
-    return T.Compose([
-        T.Lambda(lambda img: img.convert('RGB') if img.mode != 'RGB' else img),
-        T.Resize((input_size, input_size), interpolation=InterpolationMode.BICUBIC),
-        T.ToTensor(),
-        T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)
-    ])
-
-
-def find_closest_aspect_ratio(aspect_ratio, target_ratios, width, height, image_size):
-    best_ratio_diff = float('inf')
-    best_ratio = (1, 1)
-    area = width * height
-    for ratio in target_ratios:
-        target_aspect_ratio = ratio[0] / ratio[1]
-        ratio_diff = abs(aspect_ratio - target_aspect_ratio)
-        if ratio_diff < best_ratio_diff:
-            best_ratio_diff = ratio_diff
-            best_ratio = ratio
-        elif ratio_diff == best_ratio_diff:
-            if area > 0.5 * image_size * image_size * ratio[0] * ratio[1]:
-                best_ratio = ratio
-    return best_ratio
-
-
-def dynamic_preprocess(image, min_num=1, max_num=6, image_size=448, use_thumbnail=False):
-    orig_width, orig_height = image.size
-    aspect_ratio = orig_width / orig_height
-    target_ratios = set(
-        (i, j) for n in range(min_num, max_num + 1)
-        for i in range(1, n + 1) for j in range(1, n + 1)
-        if i * j <= max_num and i * j >= min_num
-    )
-    target_ratios = sorted(target_ratios, key=lambda x: x[0] * x[1])
-    target_aspect_ratio = find_closest_aspect_ratio(
-        aspect_ratio, target_ratios, orig_width, orig_height, image_size
-    )
-    target_width = image_size * target_aspect_ratio[0]
-    target_height = image_size * target_aspect_ratio[1]
-    blocks = target_aspect_ratio[0] * target_aspect_ratio[1]
-    resized_img = image.resize((target_width, target_height))
-    processed_images = []
-    for i in range(blocks):
-        box = (
-            (i % (target_width // image_size)) * image_size,
-            (i // (target_width // image_size)) * image_size,
-            ((i % (target_width // image_size)) + 1) * image_size,
-            ((i // (target_width // image_size)) + 1) * image_size
-        )
-        split_img = resized_img.crop(box)
-        processed_images.append(split_img)
-    if use_thumbnail and len(processed_images) != 1:
-        thumbnail_img = image.resize((image_size, image_size))
-        processed_images.append(thumbnail_img)
-    return processed_images
-
-
-def process_image(image, input_size=448, max_num=6):
-    """Process PIL Image to pixel values."""
-    image = image.convert('RGB')
-    transform = build_transform(input_size=input_size)
-    images = dynamic_preprocess(image, image_size=input_size, use_thumbnail=True, max_num=max_num)
-    pixel_values = [transform(img) for img in images]
-    pixel_values = torch.stack(pixel_values)
-    return pixel_values.to(torch.bfloat16)
-
-
-class CC3MDataset(Dataset):
-    def __init__(self, split='train', input_size=448, max_num=6):
-        self.input_size = input_size
-        self.max_num = max_num
-        self.dataset = load_dataset("pixparse/cc3m-wds", split=split)
-
-    def __len__(self):
-        return len(self.dataset)
-
-    def __getitem__(self, idx):
-        item = self.dataset[idx]
-        image = item['image']
-        pixel_values = process_image(image, self.input_size, self.max_num)
-        return {
-            'idx': idx,
-            'pixel_values': pixel_values,
-            'original_caption': item.get('txt', '')
-        }
-
-
 def collate_fn(batch):
     indices = [item['idx'] for item in batch]
     original_captions = [item['original_caption'] for item in batch]
@@ -113,6 +22,104 @@ def collate_fn(batch):
         'num_patches_list': num_patches_list
     }
 
+class CC3MDataset(Dataset):
+    def __init__(self, split='all', input_size=448, max_num=6, start_idx=0, end_idx=-1):
+        self.input_size = input_size
+        self.max_num = max_num
+        if split == 'all':
+            self.dataset = load_dataset('cc3m', split='train').concat(
+                load_dataset('cc3m', split='validation')
+            ).concat(
+                load_dataset('cc3m', split='test')
+            )
+        else:
+            self.dataset = load_dataset('cc3m', split=split)
+        # slice dataset
+        self.dataset = self.dataset.select(range(start_idx, end_idx)) if end_idx != -1 else self.dataset.select(range(start_idx, len(self.dataset)))
+
+        self.IMAGENET_MEAN = (0.485, 0.456, 0.406)
+        self.IMAGENET_STD = (0.229, 0.224, 0.225)
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def _build_transform(self, input_size):
+        return T.Compose([
+            T.Lambda(lambda img: img.convert('RGB') if img.mode != 'RGB' else img),
+            T.Resize((input_size, input_size), interpolation=InterpolationMode.BICUBIC),
+            T.ToTensor(),
+            T.Normalize(mean=self.IMAGENET_MEAN, std=self.IMAGENET_STD)
+        ])
+
+
+    def _find_closest_aspect_ratio(self, aspect_ratio, target_ratios, width, height, image_size):
+        best_ratio_diff = float('inf')
+        best_ratio = (1, 1)
+        area = width * height
+        for ratio in target_ratios:
+            target_aspect_ratio = ratio[0] / ratio[1]
+            ratio_diff = abs(aspect_ratio - target_aspect_ratio)
+            if ratio_diff < best_ratio_diff:
+                best_ratio_diff = ratio_diff
+                best_ratio = ratio
+            elif ratio_diff == best_ratio_diff:
+                if area > 0.5 * image_size * image_size * ratio[0] * ratio[1]:
+                    best_ratio = ratio
+        return best_ratio
+
+    
+    def _dynamic_preprocess(self,image, min_num=1, max_num=6, image_size=448, use_thumbnail=False):
+        orig_width, orig_height = image.size
+        aspect_ratio = orig_width / orig_height
+        target_ratios = set(
+            (i, j) for n in range(min_num, max_num + 1)
+            for i in range(1, n + 1) for j in range(1, n + 1)
+            if i * j <= max_num and i * j >= min_num
+        )
+        target_ratios = sorted(target_ratios, key=lambda x: x[0] * x[1])
+        target_aspect_ratio = self._find_closest_aspect_ratio(
+            aspect_ratio, target_ratios, orig_width, orig_height, image_size
+        )
+        target_width = image_size * target_aspect_ratio[0]
+        target_height = image_size * target_aspect_ratio[1]
+        blocks = target_aspect_ratio[0] * target_aspect_ratio[1]
+        resized_img = image.resize((target_width, target_height))
+        processed_images = []
+        for i in range(blocks):
+            box = (
+                (i % (target_width // image_size)) * image_size,
+                (i // (target_width // image_size)) * image_size,
+                ((i % (target_width // image_size)) + 1) * image_size,
+                ((i // (target_width // image_size)) + 1) * image_size
+            )
+            split_img = resized_img.crop(box)
+            processed_images.append(split_img)
+        if use_thumbnail and len(processed_images) != 1:
+            thumbnail_img = image.resize((image_size, image_size))
+            processed_images.append(thumbnail_img)
+        return processed_images
+
+
+
+
+    def _process_image(self,image, input_size=448, max_num=6):
+        """Process PIL Image to pixel values."""
+        image = image.convert('RGB')
+        transform = self._build_transform(input_size=input_size)
+        images = self._dynamic_preprocess(image, image_size=input_size, use_thumbnail=True, max_num=max_num)
+        pixel_values = [transform(img) for img in images]
+        pixel_values = torch.stack(pixel_values)
+        return pixel_values.to(torch.bfloat16)
+
+    def __getitem__(self, idx):
+        item = self.dataset[idx]
+        image = item['image']
+        pixel_values = self._process_image(image, self.input_size, self.max_num)
+        return {
+            'idx': idx,
+            'pixel_values': pixel_values,
+            'original_caption': item.get('txt', '')
+        }
 
 class InternVLCaptioner:
     def __init__(
@@ -166,30 +173,21 @@ class InternVLCaptioner:
         return responses
 
 
-def run_captioning(
-    output_json,
-    split='train',
-    model_path='OpenGVLab/InternVL2-8B',
-    batch_size=3,
-    device='cuda',
-    max_new_tokens=77,
-    prompt='<image>\nDescribe the image in detail.',
-    num_workers=4
-):
-    dataset = CC3MDataset(split=split)
+def main(args):
+    dataset = CC3MDataset(split=args.split,start_idx=args.start_idx,end_idx=args.end_idx)
     dataloader = DataLoader(
         dataset,
-        batch_size=batch_size,
+        batch_size=args.batch_size,
         shuffle=False,
         collate_fn=collate_fn,
-        num_workers=num_workers
+        num_workers=args.num_workers,
     )
 
     captioner = InternVLCaptioner(
-        model_path=model_path,
-        device=device,
-        max_new_tokens=max_new_tokens,
-        prompt=prompt
+        model_path=args.model_path,
+        device=args.device,
+        max_new_tokens=args.max_new_tokens,
+        prompt=args.prompt
     )
 
     results = []
@@ -207,14 +205,27 @@ def run_captioning(
                 'synthetic_caption': synthetic_caption
             })
 
-    with open(output_json, 'w') as f:
+    with open(args.output_json, 'w') as f:
         json.dump(results, f, indent=2)
 
     return results
 
 
+def arg_parser():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--output_json', type=str, default='cc3m_captions.json')
+    parser.add_argument('--split', type=str, default='train', choices=['train', 'validation', 'test', 'all'])
+    parser.add_argument('--model_path', type=str, default='OpenGVLab/InternVL2-8B')
+    parser.add_argument('--batch_size', type=int, default=32)
+    parser.add_argument('--device', type=str, default='cuda')
+    parser.add_argument('--max_new_tokens', type=int, default=77)
+    parser.add_argument('--prompt', type=str, default='<image>\nDescribe the image in detail.')
+    parser.add_argument('--num_workers', type=int, default=4)
+    parser.add_argument('--start_idx', type=int, default=0)
+    parser.add_argument('--end_idx', type=int, default=-1)
+    return parser.parse_args()
+
 if __name__ == "__main__":
-    run_captioning(
-        output_json='cc3m_captions.json',
-        batch_size=1
-    )
+    args = arg_parser()
+    main(args)
